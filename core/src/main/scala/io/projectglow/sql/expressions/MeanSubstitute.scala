@@ -92,8 +92,8 @@ case class MeanSubstitute(array: Expression, missingValue: Expression)
     )
   }
 
-  def substituteWithMean(arrayElement: Expression): Expression = {
-    If(isMissing(arrayElement), arrayMean, arrayElement)
+  def substituteWithMean(arrayElement: Expression, meanExpr: Expression): Expression = {
+    If(isMissing(arrayElement), meanExpr, arrayElement)
   }
 
   override def rewrite: Expression = {
@@ -108,6 +108,7 @@ case class MeanSubstitute(array: Expression, missingValue: Expression)
     }
 
     // Replace missing values with the provided strategy
-    array.arrayTransform(substituteWithMean(_))
+    lazy val withMean = namedStruct("array", array, "mean", arrayMean)
+    withMean.getField("array").arrayTransform(substituteWithMean(_, withMean.getField("mean")))
   }
 }
