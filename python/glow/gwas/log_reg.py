@@ -1,5 +1,6 @@
+from blosc.toplevel import unpack_array
 from pyspark.sql.types import ArrayType, StringType, StructField, DataType, StructType
-from typing import Any, Optional, Dict, Union
+from typing import Any, List, Optional, Dict, Union
 import pandas as pd
 import numpy as np
 from pyspark.sql import DataFrame, SparkSession
@@ -9,6 +10,8 @@ from typeguard import typechecked
 from nptyping import Float, NDArray
 from scipy import stats
 import opt_einsum as oe
+import blosc
+import pdb
 from . import functions as gwas_fx
 from .functions import _OffsetType, _VALUES_COLUMN_NAME
 from ..wgr.functions import reshape_for_gwas
@@ -95,13 +98,15 @@ def logistic_regression(
     Y_mask = ~(np.isnan(Y))
     np.nan_to_num(Y, copy=False)
 
-    bc_state = sc.broadcast(_create_log_reg_state(spark, phenotype_df, offset_df, sql_type, C))
+    state = _create_log_reg_state(spark, phenotype_df, offset_df, sql_type, C)
+    packed_data = pack_broadcast_data(state, Y_mask, C)
 
     phenotype_names = phenotype_df.columns.to_series().astype('str')
 
     def map_func(pdf_iterator):
+        (Y_mask_loc, C_loc, state_loc) = unpack_broadcast_data(packed_data)
         for pdf in pdf_iterator:
-            yield gwas_fx._loco_dispatch(pdf, bc_state.value, _logistic_regression_inner, C, Y_mask,
+            yield gwas_fx._loco_dispatch(pdf, state_loc, _logistic_regression_inner, C_loc, Y_mask_loc,
                                          correction, phenotype_names)
 
     return genotype_df.mapInPandas(map_func, result_struct)
@@ -112,6 +117,62 @@ class LogRegState:
     inv_CtGammaC: NDArray[(Any, Any), Float]
     gamma: NDArray[(Any, Any), Float]
     Y_res: NDArray[(Any, Any), Float]
+
+@dataclass
+class PackedBroadcastData:
+    contigs: List[str] # only for loco
+    inv_CtGammaC: bytes
+    gamma: bytes
+    Y_res: bytes
+    Y_mask: bytes
+    C: bytes
+
+def pack(array: NDArray) -> bytes:
+    ret = blosc.pack_array(array)
+    initial_len = len(array.tobytes())
+    print(f'Packed array with compression ratio of {initial_len / len(ret)}')
+    return ret
+
+def pack_broadcast_data(state: Union[LogRegState, Dict[str, LogRegState]], Y_mask, C):
+    print('Packing broadcast data')
+    if isinstance(state, dict):
+        contigs = state.keys()
+        inv_CtGammaC = np.stack([state[contig].inv_CtGammaC for contig in contigs], axis=0)
+        gamma = np.stack([state[contig].gamma for contig in contigs], axis=0)
+        Y_res = np.stack([state[contig].Y_res for contig in contigs], axis=0)
+    else:
+        contigs = None
+        inv_CtGammaC = state.inv_CtGammaC
+        gamma = state.gamma
+        Y_res = state.Y_res
+
+    return PackedBroadcastData(
+        contigs,
+        pack(inv_CtGammaC),
+        pack(gamma),
+        pack(Y_res),
+        pack(Y_mask),
+        pack(C)
+    )
+
+def unpack_broadcast_data(packed_data: PackedBroadcastData):
+    Y_mask = blosc.unpack_array(packed_data.Y_mask)
+    C = blosc.unpack_array(packed_data.C)
+    if packed_data.contigs is None:
+        state = LogRegState(
+            blosc.unpack_array(packed_data.inv_CtGammaC),
+            blosc.unpack_array(packed_data.gamma),
+            blosc.unpack_array(packed_data.Y_res)
+        )
+    else:
+        state = {}
+        for i, contig in enumerate(packed_data.contigs):
+            state[contig] = LogRegState(
+                blosc.unpack_array(packed_data.inv_CtGammaC[i, :, :, :]),
+                blosc.unpack_array(packed_data.gamma[i, :, :]),
+                blosc.unpack_array(packed_data.Y_res[i, :, :])
+            )
+    return (Y_mask, C, state)
 
 
 def _logistic_null_model_predictions(y, X, mask, offset):
