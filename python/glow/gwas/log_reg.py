@@ -75,6 +75,7 @@ def logistic_regression(
     '''
 
     spark = genotype_df.sql_ctx.sparkSession
+    sc = spark.sparkContext
     gwas_fx._check_spark_version(spark)
     gwas_fx._validate_covariates_and_phenotypes(covariate_df, phenotype_df, is_binary=True)
     sql_type = gwas_fx._regression_sql_type(dt)
@@ -94,13 +95,13 @@ def logistic_regression(
     Y_mask = ~(np.isnan(Y))
     np.nan_to_num(Y, copy=False)
 
-    state = _create_log_reg_state(spark, phenotype_df, offset_df, sql_type, C)
+    bc_state = sc.broadcast(_create_log_reg_state(spark, phenotype_df, offset_df, sql_type, C))
 
     phenotype_names = phenotype_df.columns.to_series().astype('str')
 
     def map_func(pdf_iterator):
         for pdf in pdf_iterator:
-            yield gwas_fx._loco_dispatch(pdf, state, _logistic_regression_inner, C, Y_mask,
+            yield gwas_fx._loco_dispatch(pdf, bc_state.value, _logistic_regression_inner, C, Y_mask,
                                          correction, phenotype_names)
 
     return genotype_df.mapInPandas(map_func, result_struct)
